@@ -8,9 +8,15 @@
 
 from flask import Flask, jsonify, request
 import requests
+import urllib3
 from datetime import datetime, timedelta
 import re
 import logging
+
+# Disable SSL warnings (TWSE/TAIFEX certs sometimes cause issues on Render)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
@@ -79,7 +85,7 @@ def fetch_json(url, name='unknown'):
     """打 TWSE JSON API,回傳 dict"""
     try:
         logger.info(f'[{name}] fetching: {url}')
-        res = requests.get(url, headers=HEADERS, timeout=20)
+        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)
         logger.info(f'[{name}] status: {res.status_code}')
         if res.status_code != 200:
             logger.warning(f'[{name}] non-200 response, body: {res.text[:300]}')
@@ -303,7 +309,7 @@ def fetch_taifex_html(url, params, name='taifex'):
     """打 TAIFEX,自動處理 Big5 編碼"""
     try:
         logger.info(f'[{name}] fetching: {url} params={params}')
-        res = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        res = requests.get(url, params=params, headers=HEADERS, timeout=20, verify=False)
         logger.info(f'[{name}] status: {res.status_code}, length: {len(res.content)}')
         # TAIFEX 用 Big5,但有時候也會用 UTF-8;試兩種
         try:
