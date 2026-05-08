@@ -150,34 +150,55 @@ def taiex():
         'turnover_yi': 0, 'date': date_fmt
     }
 
-    # FMTQIK = 大盤統計資訊(月資料)
-    url = f'https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date={date_compact}&response=json'
-    data = fetch_json(url, name='taiex_fmtqik')
+    # MI_INDEX = 大盤指數每日行情(單日查詢)
+    url = f'https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date_compact}&response=json'
+    data = fetch_json(url, name='taiex_mi_index')
     rows = extract_rows(data)
-    logger.info(f'[taiex] got {len(rows)} rows, looking for {roc_date}')
+    logger.info(f'[taiex] MI_INDEX got {len(rows)} rows')
 
     for row in rows:
-        if not row or len(row) < 6:
+        if not row or len(row) < 2:
             continue
-        row_date = str(row[0]).replace(' ', '').strip()
-        target_compare = roc_date.replace(' ', '')
-        if row_date == target_compare:
-            # row 結構:[日期, 成交股數, 成交金額, 成交筆數, 發行量加權股價指數, 漲跌點數]
-            turnover = to_num(row[2])
-            idx = to_num(row[4])
-            change = to_num(row[5])
-            prev = idx - change
-            pct = round(change / prev * 100, 2) if prev else 0
-            result.update({
-                'index': round(idx, 2),
-                'change': round(change, 2),
-                'changePct': pct,
-                'turnover_yi': round(turnover / 100000000, 2)
-            })
-            logger.info(f'[taiex] matched: {result}')
+        label = str(row[0]).strip()
+        if '發行量加權' in label or '加權股價指數' in label:
+            logger.info(f'[taiex] found index row: {row}')
+            try:
+                idx = to_num(row[1])
+                change = 0
+                sign = 1
+                for i in range(2, len(row)):
+                    v = str(row[i]).strip()
+                    if v in ('-', '▼'):
+                        sign = -1
+                        continue
+                    if v in ('+', '▲', ''):
+                        continue
+                    change = sign * abs(to_num(v))
+                    break
+                prev = idx - change
+                pct = round(change / prev * 100, 2) if prev else 0
+                result.update({'index': round(idx, 2), 'change': round(change, 2), 'changePct': pct})
+            except Exception as e:
+                logger.error(f'[taiex] parse index row error: {e}')
             break
-    else:
-        logger.warning(f'[taiex] no match for {roc_date}, last row: {rows[-1] if rows else "empty"}')
+
+    # FMTQIK = 月資料,補成交金額 + 備援指數
+    url2 = f'https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date={date_compact}&response=json'
+    data2 = fetch_json(url2, name='taiex_fmtqik')
+    rows2 = extract_rows(data2)
+    roc_date_clean = roc_date.replace(' ', '')
+    logger.info(f'[taiex] FMTQIK got {len(rows2)} rows, looking for {roc_date_clean}')
+    for row in rows2:
+        if not row or len(row) < 3:
+            continue
+        if str(row[0]).replace(' ', '').strip() == roc_date_clean:
+            result['turnover_yi'] = round(to_num(row[2]) / 100000000, 2)
+            if result['index'] == 0 and len(row) > 5:
+                idx = to_num(row[4]); change = to_num(row[5])
+                prev = idx - change
+                result.update({'index': round(idx,2), 'change': round(change,2),
+                               'changePct': round(change/prev*100,2) if prev else 0})
+            break
 
     # MI_5MINS_HIST = 大盤指數高低點
     try:
