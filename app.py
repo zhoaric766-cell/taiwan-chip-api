@@ -150,42 +150,37 @@ def taiex():
         'turnover_yi': 0, 'date': date_fmt
     }
 
-    # MI_INDEX = 大盤指數每日行情(單日查詢)
-    url = f'https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date_compact}&response=json'
+    # MI_INDEX?type=IND = 大盤各類指數(含發行量加權股價指數)
+    # 注意:用舊版 exchangeReport 路徑,data1 欄位存放指數資料
+    url = f'https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date_compact}&type=IND'
     data = fetch_json(url, name='taiex_mi_index')
-    rows = extract_rows(data)
-    logger.info(f'[taiex] MI_INDEX got {len(rows)} rows')
-
-    for row in rows:
+    # data1 是指數列表,每列 = [指數名稱, 收盤, 漲跌(+/-符號), 漲跌點數, 漲跌幅%]
+    data1 = data.get('data1', [])
+    logger.info(f'[taiex] MI_INDEX data1 got {len(data1)} rows')
+    for row in data1:
         if not row or len(row) < 2:
             continue
         label = str(row[0]).strip()
-        if '發行量加權' in label or '加權股價指數' in label:
-            logger.info(f'[taiex] found index row: {row}')
+        if '發行量加權' in label:
+            logger.info(f'[taiex] found weighted index row: {row}')
             try:
                 idx = to_num(row[1])
-                change = 0
-                sign = 1
-                for i in range(2, len(row)):
-                    v = str(row[i]).strip()
-                    if v in ('-', '▼'):
-                        sign = -1
-                        continue
-                    if v in ('+', '▲', ''):
-                        continue
-                    change = sign * abs(to_num(v))
-                    break
+                # row[2] = '+' or '-', row[3] = 漲跌點數, row[4] = 漲跌幅%
+                sign = -1 if (len(row) > 2 and str(row[2]).strip() == '-') else 1
+                change = sign * abs(to_num(row[3])) if len(row) > 3 else 0
+                pct = sign * abs(to_num(row[4])) if len(row) > 4 else 0
                 prev = idx - change
-                pct = round(change / prev * 100, 2) if prev else 0
-                result.update({'index': round(idx, 2), 'change': round(change, 2), 'changePct': pct})
+                if pct == 0 and prev:
+                    pct = round(change / prev * 100, 2)
+                result.update({'index': round(idx,2), 'change': round(change,2), 'changePct': round(pct,2)})
             except Exception as e:
                 logger.error(f'[taiex] parse index row error: {e}')
             break
 
-    # FMTQIK = 月資料,補成交金額 + 備援指數
-    url2 = f'https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date={date_compact}&response=json'
+    # FMTQIK = 月資料,補成交金額
+    url2 = f'https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_compact}'
     data2 = fetch_json(url2, name='taiex_fmtqik')
-    rows2 = extract_rows(data2)
+    rows2 = data2.get('data', [])
     roc_date_clean = roc_date.replace(' ', '')
     logger.info(f'[taiex] FMTQIK got {len(rows2)} rows, looking for {roc_date_clean}')
     for row in rows2:
@@ -193,11 +188,7 @@ def taiex():
             continue
         if str(row[0]).replace(' ', '').strip() == roc_date_clean:
             result['turnover_yi'] = round(to_num(row[2]) / 100000000, 2)
-            if result['index'] == 0 and len(row) > 5:
-                idx = to_num(row[4]); change = to_num(row[5])
-                prev = idx - change
-                result.update({'index': round(idx,2), 'change': round(change,2),
-                               'changePct': round(change/prev*100,2) if prev else 0})
+            logger.info(f'[taiex] turnover matched: {result["turnover_yi"]}')
             break
 
     # MI_5MINS_HIST = 大盤指數高低點
@@ -238,7 +229,7 @@ def institutional():
         'date': date_fmt
     }
 
-    url = f'https://www.twse.com.tw/rwd/zh/fund/BFI82U?dayDate={date_compact}&type=day&response=json'
+    url = f'https://www.twse.com.tw/fund/BFI82U?response=json&dayDate={date_compact}&type=day'
     data = fetch_json(url, name='institutional')
     rows = extract_rows(data)
     logger.info(f'[institutional] got {len(rows)} rows')
@@ -278,7 +269,7 @@ def margin():
 
     result = {'margin_balance': 0, 'short_units': 0, 'date': date_fmt}
 
-    url = f'https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={date_compact}&selectType=MS&response=json'
+    url = f'https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_compact}&selectType=MS'
     data = fetch_json(url, name='margin')
 
     # MI_MARGN 有多張表,我們要的是「整體市場」融資融券餘額
@@ -604,7 +595,7 @@ def debug_pcr():
 @app.route('/debug/twse_taiex')
 def debug_twse_taiex():
     target = parse_query_date()
-    url = f'https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date={target.strftime("%Y%m%d")}&response=json'
+    url = f'https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={target.strftime("%Y%m%d")}&type=IND'
     data = fetch_json(url, name='debug_twse_taiex')
     rows = extract_rows(data)
     return jsonify({
