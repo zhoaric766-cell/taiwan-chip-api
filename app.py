@@ -1,14 +1,14 @@
 """
-台股籌碼 API 中介服務 v3.0
+台股籌碼 API 中介服務 v3.1
 ============================================================
-2026-05-09 重大變更:
-- TWSE 三支(/taiex /institutional /margin)切換至 openapi.twse.com.tw
-  → 擺脫 www.twse.com.tw 對雲端 IP 的反爬封鎖(原 v2.0 SSL 修復後仍拿空陣列)
-- TAIFEX 三支(/futures /options /pcr)邏輯完全保留(已驗證可用)
-- Debug 端點強化:回傳 status_code、所有 keys、完整 raw rows,診斷力大幅提升
-- 新增 /debug/twse_institutional 與 /debug/twse_margin
+2026-05-09 SSL 修補:
+- v3.0 切換到 openapi.twse.com.tw 後,Render 容器 CA bundle 不認 TWSE 中繼憑證
+- 表現為 [SSL: CERTIFICATE_VERIFY_FAILED] Missing Subject Key Identifier
+- v3.1:fetch_openapi 與三個 debug TWSE 端點補上 verify=False(已預先 disable warnings)
+- 注意:這跟 www.twse.com.tw 之前那種「加 verify=False 也只回空陣列」不同——
+  那是真的被反爬擋掉;這個只是 cert 鏈不被 Render CA 認可而已
 
-OpenAPI 特性:
+OpenAPI 特性(沿用 v3.0 說明):
 - 不吃 date 參數,永遠回「最新已公告」交易日
 - response 內 'date' 欄位由 OpenAPI 自己的「日期」欄轉民國→西元而來
 - 因此 ?date=YYYY-MM-DD 對 TWSE 三支不再有作用,但對 TAIFEX 三支仍生效
@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 import re
 import logging
 
-# Disable SSL warnings (TAIFEX cert 仍需 verify=False;OpenAPI 不需要)
+# Disable SSL warnings (TAIFEX 與 OpenAPI 在 Render 都需要 verify=False)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
@@ -92,11 +92,14 @@ def roc_to_ad(roc_date_str):
 
 
 def fetch_openapi(path, name='openapi'):
-    """打 TWSE OpenAPI,回傳 (data, status_code, error_msg)"""
+    """打 TWSE OpenAPI,回傳 (data, status_code, error_msg)
+    
+    ★ v3.1 修補:加 verify=False(Render CA bundle 不認 TWSE 憑證鏈)
+    """
     url = f'{OPENAPI_BASE}{path}'
     try:
         logger.info(f'[{name}] fetching: {url}')
-        res = requests.get(url, headers=HEADERS, timeout=20)
+        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)  # ★
         logger.info(f'[{name}] status: {res.status_code}')
         if res.status_code != 200:
             return None, res.status_code, f'HTTP {res.status_code}: {res.text[:200]}'
@@ -117,8 +120,8 @@ def fetch_openapi(path, name='openapi'):
 def index():
     return jsonify({
         'service': '台股籌碼 API 中介服務',
-        'version': 'v3.0',
-        'note': 'TWSE 改用 openapi.twse.com.tw(擺脫雲端 IP 反爬);TAIFEX 仍直連',
+        'version': 'v3.1',
+        'note': 'TWSE 改用 openapi.twse.com.tw + verify=False;TAIFEX 仍直連',
         'twse_data_source': OPENAPI_BASE,
         'note_openapi': 'OpenAPI 不吃 date 參數,永遠回最新已公告交易日;date 參數僅對 TAIFEX 生效',
         'endpoints': [
@@ -143,7 +146,6 @@ def taiex():
         'turnover_yi': 0, 'date': ''
     }
 
-    # MI_INDEX:各類指數收盤
     data, sc, err = fetch_openapi('/exchangeReport/MI_INDEX', name='taiex_mi_index')
     if isinstance(data, list):
         for row in data:
@@ -169,7 +171,6 @@ def taiex():
     else:
         logger.error(f'[taiex] MI_INDEX failed: {err}')
 
-    # FMTQIK:嘗試補成交金額(OpenAPI 通常回最近一段歷史)
     try:
         data2, _, _ = fetch_openapi('/exchangeReport/FMTQIK', name='taiex_fmtqik')
         if isinstance(data2, list) and data2:
@@ -191,11 +192,11 @@ def taiex():
 @app.route('/institutional')
 def institutional():
     result = {
-        'foreign': 0,        # 外資及陸資(不含外資自營)
-        'foreign_dealer': 0, # 外資自營商(若 OpenAPI 有給就填)
-        'prop_self': 0,      # 自營商(自行買賣)
-        'prop_hedge': 0,     # 自營商(避險)
-        'trust': 0,          # 投信
+        'foreign': 0,
+        'foreign_dealer': 0,
+        'prop_self': 0,
+        'prop_hedge': 0,
+        'trust': 0,
         'date': ''
     }
 
@@ -210,14 +211,12 @@ def institutional():
         if not result['date']:
             result['date'] = roc_to_ad(row.get('日期', ''))
 
-        # 取單位名稱(嘗試多 key)
         name = ''
         for k in ('單位名稱', '身份別', 'name'):
             if k in row:
                 name = str(row[k]).strip()
                 break
 
-        # 取買賣差額(嘗試多 key)
         net = 0
         for k in ('買賣差額', '買賣超', '差額', 'Difference'):
             if k in row:
@@ -237,10 +236,8 @@ def institutional():
         elif '投信' in name:
             result['trust'] = net_yi
         elif '外資' in name and '自營' in name:
-            # 「外資自營商」獨立計
             result['foreign_dealer'] = net_yi
         elif '外資' in name and '不含' not in name:
-            # 「外資及陸資(不含外資自營商)」或「外資」
             result['foreign'] = net_yi
 
     return jsonify(result)
@@ -265,13 +262,11 @@ def margin():
         if not result['date']:
             result['date'] = roc_to_ad(row.get('日期', ''))
 
-        # 找「項目」欄(可能是 項目 / 信用交易 / Type)
         item = ''
         for k in ('項目', '信用交易', 'Type'):
             if k in row:
                 item = str(row[k]).strip()
                 break
-        # 萬一沒有,掃整個 row 找含「融資」/「融券」的字串
         if not item:
             for v in row.values():
                 vs = str(v)
@@ -279,7 +274,6 @@ def margin():
                     item = vs
                     break
 
-        # 找「今日餘額」(可能多種 key)
         today_val = 0
         for k in ('今日餘額', '本日餘額', "Today'sBalance", 'TodaysBalance'):
             if k in row:
@@ -512,14 +506,14 @@ def pcr():
 
 
 # =============================================================
-# Debug endpoints — TWSE OpenAPI 詳細診斷
+# Debug endpoints — TWSE OpenAPI 詳細診斷(★ v3.1 加 verify=False)
 # =============================================================
 
 @app.route('/debug/twse_taiex')
 def debug_twse_taiex():
     url = f'{OPENAPI_BASE}/exchangeReport/MI_INDEX'
     try:
-        res = requests.get(url, headers=HEADERS, timeout=20)
+        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)  # ★
         try:
             data = res.json()
             weighted = None
@@ -556,7 +550,7 @@ def debug_twse_taiex():
 def debug_twse_institutional():
     url = f'{OPENAPI_BASE}/fund/BFI82U'
     try:
-        res = requests.get(url, headers=HEADERS, timeout=20)
+        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)  # ★
         try:
             data = res.json()
             return jsonify({
@@ -585,7 +579,7 @@ def debug_twse_institutional():
 def debug_twse_margin():
     url = f'{OPENAPI_BASE}/exchangeReport/MI_MARGN'
     try:
-        res = requests.get(url, headers=HEADERS, timeout=20)
+        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)  # ★
         try:
             data = res.json()
             return jsonify({
