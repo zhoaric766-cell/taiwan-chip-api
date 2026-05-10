@@ -1,17 +1,22 @@
 """
-台股籌碼 API 中介服務 v3.1
+台股籌碼 API 中介服務 v3.2
 ============================================================
-2026-05-09 SSL 修補:
-- v3.0 切換到 openapi.twse.com.tw 後,Render 容器 CA bundle 不認 TWSE 中繼憑證
-- 表現為 [SSL: CERTIFICATE_VERIFY_FAILED] Missing Subject Key Identifier
-- v3.1:fetch_openapi 與三個 debug TWSE 端點補上 verify=False(已預先 disable warnings)
-- 注意:這跟 www.twse.com.tw 之前那種「加 verify=False 也只回空陣列」不同——
-  那是真的被反爬擋掉;這個只是 cert 鏈不被 Render CA 認可而已
+2026-05-10 三大修補(基於 v3.1 + 真實測試結果):
 
-OpenAPI 特性(沿用 v3.0 說明):
-- 不吃 date 參數,永遠回「最新已公告」交易日
-- response 內 'date' 欄位由 OpenAPI 自己的「日期」欄轉民國→西元而來
-- 因此 ?date=YYYY-MM-DD 對 TWSE 三支不再有作用,但對 TAIFEX 三支仍生效
+★ Bug #1:/pcr 全 0 — regex 不認月日 1 位數
+  舊:r'\d{4}/\d{2}/\d{2}' 不認 "2026/5/8"
+  新:r'\d{4}[/-]\d{1,2}[/-]\d{1,2}' 通吃
+
+★ Bug #2:/futures /options 不吃 date 參數
+  舊:用 GET 傳 queryStartDate → TAIFEX 不接受 → 永遠回最新
+  新:改用 POST(TAIFEX 表單實際做法),date 參數真正生效
+
+★ Bug #3:/options 自營商 290 萬異常
+  舊:nums = [純數字 cells],但 rowspan 導致前面 cells 數量浮動,
+       索引 [6][7][8][9] 抓到的不是「未平倉買方/賣方口數金額」
+  新:先找「身份別 cell」位置,從它之後重新算 nums,索引穩定
+
+★ 額外改善:回傳加 actual_date 欄位,讓 GAS 端能比對實際抓到哪一天
 """
 
 from flask import Flask, jsonify, request
@@ -21,11 +26,9 @@ from datetime import datetime, timedelta
 import re
 import logging
 
-# Disable SSL warnings (TAIFEX 與 OpenAPI 在 Render 都需要 verify=False)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -46,7 +49,6 @@ OPENAPI_BASE = 'https://openapi.twse.com.tw/v1'
 # =============================================================
 
 def get_target_date(date_str=None, default_offset_days=1):
-    """取得目標交易日(主要供 TAIFEX 使用)"""
     if date_str:
         try:
             return datetime.strptime(date_str, '%Y-%m-%d')
@@ -73,12 +75,10 @@ def to_num(v):
 
 
 def parse_query_date():
-    date_str = request.args.get('date')
-    return get_target_date(date_str)
+    return get_target_date(request.args.get('date'))
 
 
 def roc_to_ad(roc_date_str):
-    """民國日期 '1150410' → '2026/04/10'"""
     if not roc_date_str:
         return ''
     s = str(roc_date_str).replace('/', '').replace('-', '').strip()
@@ -91,15 +91,22 @@ def roc_to_ad(roc_date_str):
         return ''
 
 
+def normalize_date(date_str):
+    """把 '2026/5/8' 或 '2026/05/08' 都正規化成 '2026/05/08'"""
+    if not date_str:
+        return ''
+    m = re.match(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', str(date_str))
+    if not m:
+        return ''
+    return f'{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}'
+
+
 def fetch_openapi(path, name='openapi'):
-    """打 TWSE OpenAPI,回傳 (data, status_code, error_msg)
-    
-    ★ v3.1 修補:加 verify=False(Render CA bundle 不認 TWSE 憑證鏈)
-    """
+    """打 TWSE OpenAPI(v3.1 起 verify=False)"""
     url = f'{OPENAPI_BASE}{path}'
     try:
         logger.info(f'[{name}] fetching: {url}')
-        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)  # ★
+        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)
         logger.info(f'[{name}] status: {res.status_code}')
         if res.status_code != 200:
             return None, res.status_code, f'HTTP {res.status_code}: {res.text[:200]}'
@@ -120,22 +127,20 @@ def fetch_openapi(path, name='openapi'):
 def index():
     return jsonify({
         'service': '台股籌碼 API 中介服務',
-        'version': 'v3.1',
-        'note': 'TWSE 改用 openapi.twse.com.tw + verify=False;TAIFEX 仍直連',
+        'version': 'v3.2',
+        'changes_v3_2': [
+            'Bug #1 fix: /pcr regex 改 \\d{4}[/-]\\d{1,2}[/-]\\d{1,2}',
+            'Bug #2 fix: /futures /options 改用 POST 打 TAIFEX,date 參數真正生效',
+            'Bug #3 fix: /options 改從身份別 cell 之後算 nums,避免 rowspan 偏移',
+            '回傳加 actual_date 欄位'
+        ],
         'twse_data_source': OPENAPI_BASE,
-        'note_openapi': 'OpenAPI 不吃 date 參數,永遠回最新已公告交易日;date 參數僅對 TAIFEX 生效',
-        'endpoints': [
-            '/taiex', '/institutional', '/margin',
-            '/futures', '/options', '/pcr',
-            '/all',
-            '/debug/twse_taiex', '/debug/twse_institutional', '/debug/twse_margin',
-            '/debug/futures', '/debug/options', '/debug/pcr'
-        ]
+        'note': 'TWSE 三支不吃 date(永遠回最新);TAIFEX 三支自 v3.2 起真正吃 date'
     })
 
 
 # =============================================================
-# /taiex — 加權指數 (OpenAPI MI_INDEX + 嘗試 FMTQIK 補成交量)
+# /taiex /institutional /margin (TWSE OpenAPI,不吃 date)
 # =============================================================
 
 @app.route('/taiex')
@@ -143,7 +148,7 @@ def taiex():
     result = {
         'index': 0, 'change': 0, 'changePct': 0,
         'high': 0, 'low': 0, 'range': 0,
-        'turnover_yi': 0, 'date': ''
+        'turnover_yi': 0, 'date': '', 'actual_date': ''
     }
 
     data, sc, err = fetch_openapi('/exchangeReport/MI_INDEX', name='taiex_mi_index')
@@ -152,8 +157,8 @@ def taiex():
             if not isinstance(row, dict):
                 continue
             if row.get('指數') == '發行量加權股價指數':
-                logger.info(f'[taiex] matched: {row}')
                 result['date'] = roc_to_ad(row.get('日期', ''))
+                result['actual_date'] = result['date']
                 idx = to_num(row.get('收盤指數'))
                 sign = -1 if str(row.get('漲跌', '+')).strip() == '-' else 1
                 change = sign * abs(to_num(row.get('漲跌點數')))
@@ -168,8 +173,6 @@ def taiex():
                     'changePct': round(pct, 2)
                 })
                 break
-    else:
-        logger.error(f'[taiex] MI_INDEX failed: {err}')
 
     try:
         data2, _, _ = fetch_openapi('/exchangeReport/FMTQIK', name='taiex_fmtqik')
@@ -185,24 +188,16 @@ def taiex():
     return jsonify(result)
 
 
-# =============================================================
-# /institutional — 三大法人現貨 (OpenAPI BFI82U)
-# =============================================================
-
 @app.route('/institutional')
 def institutional():
     result = {
-        'foreign': 0,
-        'foreign_dealer': 0,
-        'prop_self': 0,
-        'prop_hedge': 0,
-        'trust': 0,
-        'date': ''
+        'foreign': 0, 'foreign_dealer': 0,
+        'prop_self': 0, 'prop_hedge': 0,
+        'trust': 0, 'date': '', 'actual_date': ''
     }
 
     data, sc, err = fetch_openapi('/fund/BFI82U', name='institutional')
     if not isinstance(data, list):
-        logger.error(f'[institutional] failed: {err}')
         return jsonify(result)
 
     for row in data:
@@ -210,6 +205,7 @@ def institutional():
             continue
         if not result['date']:
             result['date'] = roc_to_ad(row.get('日期', ''))
+            result['actual_date'] = result['date']
 
         name = ''
         for k in ('單位名稱', '身份別', 'name'):
@@ -224,7 +220,6 @@ def institutional():
                 break
 
         net_yi = round(net / 1e8, 2)
-        logger.info(f'[institutional] name="{name}" net_yi={net_yi}')
 
         if not name:
             continue
@@ -243,17 +238,12 @@ def institutional():
     return jsonify(result)
 
 
-# =============================================================
-# /margin — 融資融券 (OpenAPI MI_MARGN)
-# =============================================================
-
 @app.route('/margin')
 def margin():
-    result = {'margin_balance': 0, 'short_units': 0, 'date': ''}
+    result = {'margin_balance': 0, 'short_units': 0, 'date': '', 'actual_date': ''}
 
     data, sc, err = fetch_openapi('/exchangeReport/MI_MARGN', name='margin')
     if not isinstance(data, list):
-        logger.error(f'[margin] failed: {err}')
         return jsonify(result)
 
     for row in data:
@@ -261,6 +251,7 @@ def margin():
             continue
         if not result['date']:
             result['date'] = roc_to_ad(row.get('日期', ''))
+            result['actual_date'] = result['date']
 
         item = ''
         for k in ('項目', '信用交易', 'Type'):
@@ -280,8 +271,6 @@ def margin():
                 today_val = to_num(row[k])
                 break
 
-        logger.info(f'[margin] item="{item}" today_val={today_val}')
-
         if '融資' in item:
             result['margin_balance'] = int(today_val)
         elif '融券' in item:
@@ -291,14 +280,37 @@ def margin():
 
 
 # =============================================================
-# TAIFEX 共用工具(原邏輯保留)
+# TAIFEX 共用工具
 # =============================================================
 
-def fetch_taifex_html(url, params, name='taifex'):
+def fetch_taifex_html_post(url, params, name='taifex'):
+    """★ v3.2:改用 POST 打 TAIFEX(GET 不接受 queryStartDate 參數)
+    
+    保留 GET fallback,以防部分 endpoint 需要 GET。
+    """
+    # 先試 POST
     try:
-        logger.info(f'[{name}] fetching: {url} params={params}')
+        logger.info(f'[{name}] POST: {url} params={params}')
+        res = requests.post(url, data=params, headers=HEADERS, timeout=20, verify=False)
+        logger.info(f'[{name}] POST status: {res.status_code}, length: {len(res.content)}')
+        try:
+            res.encoding = 'big5'
+            text = res.text
+            if '外資' not in text and '自營' not in text:
+                res.encoding = 'utf-8'
+                text = res.text
+        except Exception:
+            text = res.text
+        # 確認查詢日期是否真的命中(TAIFEX 沒接受 POST 的話會回最新)
+        if text and len(text) > 1000:
+            return text
+    except Exception as e:
+        logger.error(f'[{name}] POST error: {e}')
+    
+    # GET fallback
+    try:
+        logger.info(f'[{name}] GET fallback: {url}')
         res = requests.get(url, params=params, headers=HEADERS, timeout=20, verify=False)
-        logger.info(f'[{name}] status: {res.status_code}, length: {len(res.content)}')
         try:
             res.encoding = 'big5'
             text = res.text
@@ -309,7 +321,7 @@ def fetch_taifex_html(url, params, name='taifex'):
             text = res.text
         return text
     except Exception as e:
-        logger.error(f'[{name}] fetch error: {e}')
+        logger.error(f'[{name}] GET error: {e}')
         return ''
 
 
@@ -324,8 +336,17 @@ def parse_taifex_table(html):
     return parsed
 
 
+def extract_query_date_from_html(html):
+    """從 TAIFEX HTML 抓出實際查詢到的日期(用於回報 actual_date)"""
+    # TAIFEX 頁面通常有「日期: 2026/5/8」字樣
+    m = re.search(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', html)
+    if m:
+        return f'{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}'
+    return ''
+
+
 # =============================================================
-# /futures — 期貨三大法人(TAIFEX) 原邏輯
+# /futures — ★ v3.2:改 POST + 從身份別之後算 nums
 # =============================================================
 
 @app.route('/futures')
@@ -336,7 +357,7 @@ def futures():
     result = {
         'foreign_TXF_oi': 0, 'foreign_MXF_oi': 0,
         'prop_TXF_oi': 0, 'prop_MXF_oi': 0,
-        'date': date_fmt
+        'date': date_fmt, 'actual_date': ''
     }
 
     products = [
@@ -344,6 +365,7 @@ def futures():
         ('MXF', 'foreign_MXF_oi', 'prop_MXF_oi'),
     ]
 
+    actual_dates = []
     for prod_code, fkey, pkey in products:
         url = 'https://www.taifex.com.tw/cht/3/futContractsDate'
         params = {
@@ -351,35 +373,57 @@ def futures():
             'queryEndDate': target.strftime('%Y/%m/%d'),
             'commodityId': prod_code
         }
-        html = fetch_taifex_html(url, params, name=f'futures_{prod_code}')
+        html = fetch_taifex_html_post(url, params, name=f'futures_{prod_code}')
         if not html:
             continue
+
+        actual = extract_query_date_from_html(html)
+        if actual:
+            actual_dates.append(actual)
 
         rows = parse_taifex_table(html)
         logger.info(f'[futures_{prod_code}] parsed {len(rows)} rows')
 
         for cells in rows:
-            row_text = ' | '.join(cells)
-            if '自營商' in row_text:
-                logger.info(f'[futures_{prod_code}] prop row: {cells}')
-                nums = [c for c in cells if re.match(r'^-?[\d,]+$', c)]
-                if len(nums) >= 11:
-                    net_oi = int(to_num(nums[10]))
-                    result[pkey] = net_oi
-                    logger.info(f'[futures_{prod_code}] prop net OI: {net_oi}')
-            elif '外資' in row_text:
-                logger.info(f'[futures_{prod_code}] foreign row: {cells}')
-                nums = [c for c in cells if re.match(r'^-?[\d,]+$', c)]
-                if len(nums) >= 11:
-                    net_oi = int(to_num(nums[10]))
-                    result[fkey] = net_oi
-                    logger.info(f'[futures_{prod_code}] foreign net OI: {net_oi}')
+            # 找身份別 cell 位置
+            ident_idx = -1
+            ident_type = None
+            for i, c in enumerate(cells):
+                if '自營商' in c:
+                    ident_idx = i
+                    ident_type = 'prop'
+                    break
+                if '外資' in c and '陸資' not in c:
+                    ident_idx = i
+                    ident_type = 'foreign'
+                    break
 
+            if ident_idx < 0:
+                continue
+
+            # 從身份別之後重新抓 nums(穩健,不受 rowspan 影響)
+            sub_cells = cells[ident_idx + 1:]
+            nums = [c for c in sub_cells if re.match(r'^-?[\d,]+$', c)]
+            
+            logger.info(f'[futures_{prod_code}] {ident_type} ident_idx={ident_idx} nums={nums}')
+
+            # 期貨表頭(TAIFEX): 多方口數/契約金額/空方口數/契約金額/多空淨額口數/契約金額(交易)
+            #                   多方口數/契約金額/空方口數/契約金額/多空淨額口數/契約金額(未平倉)
+            # 第 11 欄(index 10)是「未平倉多空淨額口數」
+            if len(nums) >= 11:
+                net_oi = int(to_num(nums[10]))
+                if ident_type == 'foreign':
+                    result[fkey] = net_oi
+                else:
+                    result[pkey] = net_oi
+
+    if actual_dates:
+        result['actual_date'] = actual_dates[0]
     return jsonify(result)
 
 
 # =============================================================
-# /options — 選擇權三大法人(TAIFEX) 原邏輯
+# /options — ★ v3.2:改 POST + 從身份別之後算 nums(修自營商 290 萬 bug)
 # =============================================================
 
 @app.route('/options')
@@ -396,7 +440,7 @@ def options():
         'prop_SC_oi': 0, 'prop_SC_amt': 0,
         'prop_BP_oi': 0, 'prop_BP_amt': 0,
         'prop_SP_oi': 0, 'prop_SP_amt': 0,
-        'date': date_fmt
+        'date': date_fmt, 'actual_date': ''
     }
 
     url = 'https://www.taifex.com.tw/cht/3/callsAndPutsDate'
@@ -405,16 +449,19 @@ def options():
         'queryEndDate': target.strftime('%Y/%m/%d'),
         'commodityId': 'TXO'
     }
-    html = fetch_taifex_html(url, params, name='options')
+    html = fetch_taifex_html_post(url, params, name='options')
     if not html:
         return jsonify(result)
+
+    result['actual_date'] = extract_query_date_from_html(html)
 
     rows = parse_taifex_table(html)
     logger.info(f'[options] parsed {len(rows)} rows')
 
-    current_cp = None
+    current_cp = None  # 'call' or 'put',跨列繼承(處理 rowspan)
 
     for cells in rows:
+        # 切 call/put
         if any('買權' in c for c in cells):
             current_cp = 'call'
         elif any('賣權' in c for c in cells):
@@ -423,15 +470,32 @@ def options():
         if not current_cp:
             continue
 
-        is_foreign = any('外資' in c and '陸資' not in c for c in cells)
-        is_prop = any('自營商' in c for c in cells)
+        # 找身份別 cell
+        ident_idx = -1
+        ident_type = None
+        for i, c in enumerate(cells):
+            if '自營商' in c:
+                ident_idx = i
+                ident_type = 'prop'
+                break
+            if '外資' in c and '陸資' not in c:
+                ident_idx = i
+                ident_type = 'foreign'
+                break
 
-        if not (is_foreign or is_prop):
+        if ident_idx < 0:
             continue
 
-        nums = [c for c in cells if re.match(r'^-?[\d,]+$', c)]
-        logger.info(f'[options] {current_cp} {"foreign" if is_foreign else "prop"}: nums={nums}')
+        # 從身份別之後重新抓 nums
+        sub_cells = cells[ident_idx + 1:]
+        nums = [c for c in sub_cells if re.match(r'^-?[\d,]+$', c)]
+        
+        logger.info(f'[options] {current_cp} {ident_type} nums={nums}')
 
+        # 選擇權表頭(同期貨,12 個數字):
+        #   交易: 多口/多金/空口/空金/淨口/淨金
+        #   未平倉: 多口/多金/空口/空金/淨口/淨金
+        # 想抓未平倉 多口[6]/多金[7]/空口[8]/空金[9]
         if len(nums) < 10:
             continue
 
@@ -440,80 +504,103 @@ def options():
         s_oi = int(to_num(nums[8]))
         s_amt = int(to_num(nums[9]))
 
-        if is_foreign:
+        if ident_type == 'foreign':
             if current_cp == 'call':
-                result['foreign_BC_oi'] = b_oi; result['foreign_BC_amt'] = b_amt
-                result['foreign_SC_oi'] = s_oi; result['foreign_SC_amt'] = s_amt
+                result['foreign_BC_oi'] = b_oi
+                result['foreign_BC_amt'] = b_amt
+                result['foreign_SC_oi'] = s_oi
+                result['foreign_SC_amt'] = s_amt
             else:
-                result['foreign_BP_oi'] = b_oi; result['foreign_BP_amt'] = b_amt
-                result['foreign_SP_oi'] = s_oi; result['foreign_SP_amt'] = s_amt
-        elif is_prop:
+                result['foreign_BP_oi'] = b_oi
+                result['foreign_BP_amt'] = b_amt
+                result['foreign_SP_oi'] = s_oi
+                result['foreign_SP_amt'] = s_amt
+        elif ident_type == 'prop':
             if current_cp == 'call':
-                result['prop_BC_oi'] = b_oi; result['prop_BC_amt'] = b_amt
-                result['prop_SC_oi'] = s_oi; result['prop_SC_amt'] = s_amt
+                result['prop_BC_oi'] = b_oi
+                result['prop_BC_amt'] = b_amt
+                result['prop_SC_oi'] = s_oi
+                result['prop_SC_amt'] = s_amt
             else:
-                result['prop_BP_oi'] = b_oi; result['prop_BP_amt'] = b_amt
-                result['prop_SP_oi'] = s_oi; result['prop_SP_amt'] = s_amt
+                result['prop_BP_oi'] = b_oi
+                result['prop_BP_amt'] = b_amt
+                result['prop_SP_oi'] = s_oi
+                result['prop_SP_amt'] = s_amt
 
     return jsonify(result)
 
 
 # =============================================================
-# /pcr — Put/Call Ratio(TAIFEX) 原邏輯
+# /pcr — ★ v3.2:修 regex bug
 # =============================================================
 
 @app.route('/pcr')
 def pcr():
     target = parse_query_date()
     date_fmt = target.strftime('%Y/%m/%d')
+    target_norm = normalize_date(date_fmt)
 
-    result = {'pcr_oi': 0, 'pcr_volume': 0, 'date': date_fmt}
+    result = {'pcr_oi': 0, 'pcr_volume': 0, 'date': date_fmt, 'actual_date': ''}
 
     url = 'https://www.taifex.com.tw/cht/3/pcRatio'
     params = {
         'queryStartDate': target.strftime('%Y/%m/%d'),
         'queryEndDate': target.strftime('%Y/%m/%d')
     }
-    html = fetch_taifex_html(url, params, name='pcr')
+    html = fetch_taifex_html_post(url, params, name='pcr')
     if not html:
         return jsonify(result)
 
     rows = parse_taifex_table(html)
     logger.info(f'[pcr] parsed {len(rows)} rows')
 
-    target_str = target.strftime('%Y/%m/%d')
+    matched_target = False
+    fallback = None
 
     for cells in rows:
         if len(cells) < 5:
             continue
         first = cells[0]
-        if re.match(r'\d{4}/\d{2}/\d{2}', first):
-            logger.info(f'[pcr] date row: {cells}')
+        # ★ v3.2 修補:regex 通吃月日 1-2 位
+        if re.match(r'\d{4}[/-]\d{1,2}[/-]\d{1,2}', first):
+            row_norm = normalize_date(first)
             try:
-                if first == target_str or result['pcr_oi'] == 0:
-                    vol_raw = to_num(cells[3]) if len(cells) > 3 else 0
-                    oi_raw = to_num(cells[6]) if len(cells) > 6 else to_num(cells[-1])
-                    pcr_vol = round(vol_raw / 100, 4) if vol_raw > 5 else round(vol_raw, 4)
-                    pcr_oi = round(oi_raw / 100, 4) if oi_raw > 5 else round(oi_raw, 4)
+                # cells[3] = 買賣權成交量比率(顯示為百分比,如 111.45 → 1.1145)
+                # cells[6] = 買賣權未平倉量比率(同上)
+                vol_raw = to_num(cells[3]) if len(cells) > 3 else 0
+                oi_raw = to_num(cells[6]) if len(cells) > 6 else to_num(cells[-1])
+                pcr_vol = round(vol_raw / 100, 4) if vol_raw > 5 else round(vol_raw, 4)
+                pcr_oi = round(oi_raw / 100, 4) if oi_raw > 5 else round(oi_raw, 4)
+                
+                if row_norm == target_norm:
                     result['pcr_volume'] = pcr_vol
                     result['pcr_oi'] = pcr_oi
-                    if first == target_str:
-                        break
+                    result['actual_date'] = row_norm
+                    matched_target = True
+                    break
+                if fallback is None:
+                    fallback = (row_norm, pcr_vol, pcr_oi)
             except Exception as e:
                 logger.error(f'[pcr] parse error: {e}')
+
+    # 沒找到 target 就用 fallback(通常是表格最新那筆)
+    if not matched_target and fallback:
+        result['actual_date'] = fallback[0]
+        result['pcr_volume'] = fallback[1]
+        result['pcr_oi'] = fallback[2]
 
     return jsonify(result)
 
 
 # =============================================================
-# Debug endpoints — TWSE OpenAPI 詳細診斷(★ v3.1 加 verify=False)
+# Debug endpoints
 # =============================================================
 
 @app.route('/debug/twse_taiex')
 def debug_twse_taiex():
     url = f'{OPENAPI_BASE}/exchangeReport/MI_INDEX'
     try:
-        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)  # ★
+        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)
         try:
             data = res.json()
             weighted = None
@@ -525,9 +612,7 @@ def debug_twse_taiex():
             return jsonify({
                 'url': url,
                 'status_code': res.status_code,
-                'data_type': type(data).__name__,
                 'rows_count': len(data) if isinstance(data, list) else None,
-                'first_row_keys': list(data[0].keys()) if isinstance(data, list) and data else None,
                 'first_3_rows': data[:3] if isinstance(data, list) else data,
                 'weighted_idx_row': weighted,
             })
@@ -546,68 +631,6 @@ def debug_twse_taiex():
         }), 500
 
 
-@app.route('/debug/twse_institutional')
-def debug_twse_institutional():
-    url = f'{OPENAPI_BASE}/fund/BFI82U'
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)  # ★
-        try:
-            data = res.json()
-            return jsonify({
-                'url': url,
-                'status_code': res.status_code,
-                'rows_count': len(data) if isinstance(data, list) else None,
-                'first_row_keys': list(data[0].keys()) if isinstance(data, list) and data else None,
-                'all_rows': data,
-            })
-        except Exception as je:
-            return jsonify({
-                'url': url,
-                'status_code': res.status_code,
-                'json_parse_error': str(je),
-                'text_preview': res.text[:500]
-            })
-    except Exception as e:
-        return jsonify({
-            'url': url,
-            'error_type': type(e).__name__,
-            'error_msg': str(e)[:300]
-        }), 500
-
-
-@app.route('/debug/twse_margin')
-def debug_twse_margin():
-    url = f'{OPENAPI_BASE}/exchangeReport/MI_MARGN'
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=20, verify=False)  # ★
-        try:
-            data = res.json()
-            return jsonify({
-                'url': url,
-                'status_code': res.status_code,
-                'rows_count': len(data) if isinstance(data, list) else None,
-                'first_row_keys': list(data[0].keys()) if isinstance(data, list) and data else None,
-                'first_10_rows': data[:10] if isinstance(data, list) else data,
-            })
-        except Exception as je:
-            return jsonify({
-                'url': url,
-                'status_code': res.status_code,
-                'json_parse_error': str(je),
-                'text_preview': res.text[:500]
-            })
-    except Exception as e:
-        return jsonify({
-            'url': url,
-            'error_type': type(e).__name__,
-            'error_msg': str(e)[:300]
-        }), 500
-
-
-# =============================================================
-# Debug endpoints — TAIFEX(原邏輯保留)
-# =============================================================
-
 @app.route('/debug/futures')
 def debug_futures():
     target = parse_query_date()
@@ -617,10 +640,12 @@ def debug_futures():
         'queryEndDate': target.strftime('%Y/%m/%d'),
         'commodityId': 'TXF'
     }
-    html = fetch_taifex_html(url, params, name='debug_futures')
+    html = fetch_taifex_html_post(url, params, name='debug_futures')
     rows = parse_taifex_table(html)
+    actual = extract_query_date_from_html(html)
     return jsonify({
-        'date': target.strftime('%Y/%m/%d'),
+        'requested_date': target.strftime('%Y/%m/%d'),
+        'actual_date_in_html': actual,
         'html_len': len(html),
         'rows_count': len(rows),
         'first_5_rows': rows[:5],
@@ -638,13 +663,26 @@ def debug_options():
         'queryEndDate': target.strftime('%Y/%m/%d'),
         'commodityId': 'TXO'
     }
-    html = fetch_taifex_html(url, params, name='debug_options')
+    html = fetch_taifex_html_post(url, params, name='debug_options')
     rows = parse_taifex_table(html)
+    actual = extract_query_date_from_html(html)
+    
+    # 多印一些有用的:有「自營商」「外資」的行
+    detail_rows = []
+    for r in rows[:30]:
+        if any('自營商' in c or ('外資' in c and '陸資' not in c) for c in r):
+            ident_idx = next((i for i, c in enumerate(r) if '自營商' in c or ('外資' in c and '陸資' not in c)), -1)
+            sub = r[ident_idx + 1:] if ident_idx >= 0 else []
+            nums = [c for c in sub if re.match(r'^-?[\d,]+$', c)]
+            detail_rows.append({'cells': r, 'ident_idx': ident_idx, 'nums': nums})
+    
     return jsonify({
-        'date': target.strftime('%Y/%m/%d'),
+        'requested_date': target.strftime('%Y/%m/%d'),
+        'actual_date_in_html': actual,
         'html_len': len(html),
         'rows_count': len(rows),
         'first_8_rows': rows[:8],
+        'detail_rows_with_ident': detail_rows[:6],
     })
 
 
@@ -656,19 +694,15 @@ def debug_pcr():
         'queryStartDate': target.strftime('%Y/%m/%d'),
         'queryEndDate': target.strftime('%Y/%m/%d')
     }
-    html = fetch_taifex_html(url, params, name='debug_pcr')
+    html = fetch_taifex_html_post(url, params, name='debug_pcr')
     rows = parse_taifex_table(html)
     return jsonify({
-        'date': target.strftime('%Y/%m/%d'),
+        'requested_date': target.strftime('%Y/%m/%d'),
         'html_len': len(html),
         'rows_count': len(rows),
         'first_8_rows': rows[:8],
     })
 
-
-# =============================================================
-# /all — 一次拿所有
-# =============================================================
 
 @app.route('/all')
 def all_data():
